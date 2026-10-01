@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Can I fly?</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+        }
+        #map {
+            height: 100%;
+        }
+        .panel {
+            background: white;
+            padding: 10px 14px;
+            border-radius: 6px;
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.3);
+            font: 13px sans-serif;
+            width: 240px;
+        }
+        .panel input[type=range] {
+            width: 100%;
+        }
+        .legend {
+            margin-top: 8px;
+        }
+        .value {
+            font-weight: bold;
+        }
+        .hint {
+            color: #666;
+            margin-top: 6px;
+        }
+        .legend div {
+            display: flex;
+            align-items: center;
+            margin-top: 4px;
+        }
+        .swatch {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .count {
+            margin-left: auto;
+            color: #444;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="airports.js"></script>
+    <script src="reach.js"></script>
+    <script>
+        // Categories by number of flights from the start: start, direct, one stop, two or more stops; GRAY for not reachable
+        const COLORS = ['#1f6feb', '#2ca02c', '#e6b800', '#d62728'];
+        const GRAY = '#999';
+        const LABELS = ['Start', 'Direct', '1 stop', '2+ stops'];
+        const UNREACHABLE = 4;  // Category index of not reachable airports
+
+        // Category of an airport from its number of flights (see computeFlights)
+        function category(flightCount) {
+            return flightCount === -1 ? UNREACHABLE : Math.min(flightCount, 3);
+        }
+
+        const map = L.map('map', {worldCopyJump: true, preferCanvas: true}).setView([30, 10], 3);
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors | Airports: <a href="https://ourairports.com/data/">OurAirports</a>',
+            maxZoom: 19,
+        }).addTo(map);
+
+        const vectors = toUnitVectors(AIRPORTS);
+        let start = null;  // Index of the starting airport
+        let rangeKm = 3000;
+        let minLength = 1800, minWidth = 30;  // Runway requirements in meters
+        const eligible = new Uint8Array(AIRPORTS.length);  // 1 if the airport meets the runway requirements (and is shown)
+        const shownCategory = new Int8Array(AIRPORTS.length).fill(UNREACHABLE);  // Current color of each marker
+
+        const formatMeters = m => Math.round(m).toLocaleString('en-US');
+
+        // Canvas with a larger click tolerance, so the small circles are easy to click
+        const renderer = L.canvas({tolerance: 4});
+        const markers = AIRPORTS.map(([code, lat, lon, name, length, width], i) =>
+            L.circleMarker([lat, lon], {renderer, radius: 3, stroke: false, fillColor: GRAY, fillOpacity: 0.8})
+                .bindTooltip(`${code} – ${name}<br>Runway: ${formatMeters(length)} m × ${width === null ? '?' : formatMeters(width)} m`)
+                .on('click', () => {
+                    start = i;
+                    recompute();
+                }));
+
+        // Control panel with the sliders and the legend
+        const panel = L.control({position: 'topright'});
+        panel.onAdd = () => {
+            const div = L.DomUtil.create('div', 'panel');
+            div.innerHTML = `
+                <div>Range: <span class="value range-value"></span></div>
+                <input type="range" class="range" min="0" max="25000" step="100" value="${rangeKm}">
+                <div>Min. runway length: <span class="value min-length-value"></span></div>
+                <input type="range" class="min-length" min="0" max="5000" step="100" value="${minLength}">
+                <div>Min. runway width: <span class="value min-width-value"></span></div>
+                <input type="range" class="min-width" min="0" max="100" step="5" value="${minWidth}">
+                <div class="legend">${LABELS.map((label, i) =>
+                    `<div><span class="swatch" style="background: ${COLORS[i]}"></span>${label}<span class="count"></span></div>`).join('')}
+                    <div><span class="swatch" style="background: ${GRAY}"></span>Not reachable<span class="count"></span></div>
+                </div>
+                <div class="hint"></div>`;
+            L.DomEvent.disableClickPropagation(div);  // Don't pan the map while dragging a slider
+            return div;
+        };
+        panel.addTo(map);
+        const rangeSlider = document.querySelector('.range');
+        const minLengthSlider = document.querySelector('.min-length');
+        const minWidthSlider = document.querySelector('.min-width');
+        const counts = document.querySelectorAll('.legend .count');
+        const hint = document.querySelector('.hint');
+
+        // Recompute at most once per frame while dragging a slider
+        let pending = false;
+        function scheduleRecompute() {
+            if (pending) return;
+            pending = true;
+            requestAnimationFrame(() => {
+                pending = false;
+                recompute();
+            });
+        }
+        rangeSlider.addEventListener('input', () => {
+            rangeKm = Number(rangeSlider.value);
+            updateValues();
+            scheduleRecompute();
+        });
+        minLengthSlider.addEventListener('input', () => {
+            minLength = Number(minLengthSlider.value);
+            updateValues();
+            scheduleRecompute();
+        });
+        minWidthSlider.addEventListener('input', () => {
+            minWidth = Number(minWidthSlider.value);
+            updateValues();
+            scheduleRecompute();
+        });
+
+        // Shows the current slider values next to their labels
+        function updateValues() {
+            document.querySelector('.range-value').textContent = `${rangeKm.toLocaleString('en-US')} km`;
+            document.querySelector('.min-length-value').textContent = `${minLength.toLocaleString('en-US')} m`;
+            document.querySelector('.min-width-value').textContent = `${minWidth} m`;
+        }
+
+        // Shows the airports that meet the runway requirements and hides the others.
+        // Airports with an unknown runway width only need to meet the length requirement.
+        function updateEligibility() {
+            AIRPORTS.forEach(([, , , , length, width], i) => {
+                const ok = length >= minLength && (width === null || width >= minWidth) ? 1 : 0;
+                if (ok === eligible[i]) return;
+                eligible[i] = ok;
+                if (ok) markers[i].addTo(map);
+                else markers[i].remove();
+            });
+        }
+
+        // Updates the visible airports and their colors. The start is remembered even if it stops meeting the
+        // requirements, so it comes back when they are relaxed again.
+        function recompute() {
+            updateEligibility();
+            const hasStart = start !== null && eligible[start];
+            const flights = hasStart ? computeFlights(vectors, start, rangeKm, eligible) : null;
+            const totals = [0, 0, 0, 0, 0];  // Per category, of the shown airports
+            markers.forEach((marker, i) => {
+                const c = flights ? category(flights[i]) : UNREACHABLE;
+                if (eligible[i]) totals[c]++;
+                if (shownCategory[i] === c) return;  // Unchanged, skip the redraw
+                shownCategory[i] = c;
+                marker.setStyle({fillColor: c === UNREACHABLE ? GRAY : COLORS[c], fillOpacity: c === UNREACHABLE ? 0.8 : 1});
+                marker.setRadius(c === 0 ? 6 : 3);
+                if (!eligible[i]) return;
+                // Keep reachable airports on top of the gray ones
+                if (c === UNREACHABLE) marker.bringToBack();
+                else marker.bringToFront();
+            });
+            if (hasStart) markers[start].bringToFront();
+            counts.forEach((el, i) => el.textContent = flights ? totals[i].toLocaleString('en-US') : '');
+            const shown = `${totals.reduce((a, b) => a + b).toLocaleString('en-US')} airports shown.`;
+            if (start === null) hint.textContent = `${shown} Click an airport to choose the starting point.`;
+            else if (!hasStart) hint.textContent = `${shown} The starting airport, ${AIRPORTS[start][0]}, doesn't meet the runway requirements.`;
+            else hint.textContent = `${shown} From ${AIRPORTS[start][0]} – ${AIRPORTS[start][3]}. Click another airport to change.`;
+        }
+
+        updateValues();
+        recompute();
+    </script>
+</body>
+</html>
